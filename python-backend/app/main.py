@@ -203,6 +203,203 @@ async def create_booking_naive(req: BookingCreateRequest, db: Session = Depends(
         }
     }
 
+# -------------------------------------------------------------
+# 5. PHASE 3: OPTIMISTIC LOCKING (Version-Check Pattern)
+# -------------------------------------------------------------
+@app.post("/api/bookings/optimistic", status_code=status.HTTP_201_CREATED)
+async def create_booking_optimistic(req: BookingCreateRequest, db: Session = Depends(get_db)):
+    """
+    🛡️ PHASE 3: OPTIMISTIC LOCKING PATTERN
+    
+    How it works:
+    1. Read the seats and capture their CURRENT `version` numbers.
+    2. Sleep 100ms (simulate network / payment latency).
+    3. ATOMIC WRITE: Update each seat ONLY IF its status is still AVAILABLE AND its version has NOT changed.
+       SQL generated:
+       UPDATE show_seats
+       SET status = 'BOOKED', version = version + 1
+       WHERE id = :id AND status = 'AVAILABLE' AND version = :captured_version;
+    4. If another transaction modified the seat in the meantime, version will mismatch,
+       and rows_updated will be 0!
+    5. Detect the conflict, rollback, and reject with HTTP 409 Conflict.
+    """
+    # Step 1: Read seats and their current versions
+    seats = (
+        db.query(ShowSeat)
+        .options(joinedload(ShowSeat.seat))
+        .filter(ShowSeat.id.in_(req.showSeatIds), ShowSeat.show_id == req.showId)
+        .all()
+    )
+
+    if len(seats) != len(req.showSeatIds):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="One or more selected seats do not exist for this show"
+        )
+
+    # Initial availability check
+    unavailable = [s for s in seats if s.status != SeatStatus.AVAILABLE]
+    if unavailable:
+        seat_labels = ", ".join([f"{s.seat.row}{s.seat.number}" for s in unavailable])
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Seats [{seat_labels}] are already taken"
+        )
+
+    # Capture the versions at read-time
+    seat_versions = {s.id: s.version for s in seats}
+
+    # Step 2: Artificial latency window (simulates network / payment tokenization)
+    await asyncio.sleep(0.1)
+
+    # Step 3: Atomic write with version check
+    updated_count = 0
+    for s in seats:
+        count = (
+            db.query(ShowSeat)
+            .filter(
+                ShowSeat.id == s.id,
+                ShowSeat.status == SeatStatus.AVAILABLE,
+                ShowSeat.version == seat_versions[s.id]
+            )
+            .update(
+                {
+                    ShowSeat.status: SeatStatus.BOOKED,
+                    ShowSeat.version: seat_versions[s.id] + 1
+                },
+                synchronize_session=False
+            )
+        )
+        updated_count += count
+
+    # Step 4: Verify whether ALL requested seats were successfully claimed
+    if updated_count != len(seats):
+        # 💥 Race detected! Another concurrent request took the seat first!
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Concurrency Conflict: Seat was just booked by another user! Transaction aborted."
+        )
+
+    # Step 5: Safely create booking record
+    total_amount = sum(s.price for s in seats)
+    booking = Booking(
+        user_id=req.userId,
+        show_id=req.showId,
+        status=BookingStatus.CONFIRMED,
+        total_amount=total_amount
+    )
+    db.add(booking)
+    db.flush()
+
+    for s in seats:
+        item = BookingItem(
+            booking_id=booking.id,
+            show_seat_id=s.id,
+            price=s.price
+        )
+        db.add(item)
+
+    db.commit()
+    db.refresh(booking)
+
+    return {
+        "message": "Booking created successfully (Optimistic Locking Mode)",
+        "data": {
+            "id": booking.id,
+            "userId": booking.user_id,
+            "showId": booking.show_id,
+            "status": booking.status.value,
+            "totalAmount": booking.total_amount,
+            "createdAt": booking.created_at.isoformat()
+        }
+    }
+
+# -------------------------------------------------------------
+# 6. PHASE 3: PESSIMISTIC LOCKING (Row Lock Pattern)
+# -------------------------------------------------------------
+@app.post("/api/bookings/pessimistic", status_code=status.HTTP_201_CREATED)
+async def create_booking_pessimistic(req: BookingCreateRequest, db: Session = Depends(get_db)):
+    """
+    🛡️ PHASE 3: PESSIMISTIC ROW-LOCKING PATTERN
+    
+    How it works:
+    1. Query seats using `.with_for_update()`.
+       In PostgreSQL, this executes `SELECT ... FOR UPDATE`, placing an exclusive row-level lock.
+    2. Concurrent transactions trying to read these rows are paused by the database engine.
+    3. We check availability: if already booked, we abort with 409.
+    4. We update to BOOKED and commit.
+    5. Locks are automatically released when the transaction commits.
+    """
+    try:
+        # Step 1: Query seats with exclusive row locks (FOR UPDATE)
+        # Note: with_for_update() locks rows in PostgreSQL/MySQL
+        seats = (
+            db.query(ShowSeat)
+            .filter(ShowSeat.id.in_(req.showSeatIds), ShowSeat.show_id == req.showId)
+            .with_for_update()
+            .all()
+        )
+
+        if len(seats) != len(req.showSeatIds):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="One or more selected seats do not exist for this show"
+            )
+
+        unavailable = [s for s in seats if s.status != SeatStatus.AVAILABLE]
+        if unavailable:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Seat is already taken"
+            )
+
+        # Artificial latency window while lock is held
+        await asyncio.sleep(0.1)
+
+        # Step 2: Update seats
+        total_amount = sum(s.price for s in seats)
+        for s in seats:
+            s.status = SeatStatus.BOOKED
+
+        booking = Booking(
+            user_id=req.userId,
+            show_id=req.showId,
+            status=BookingStatus.CONFIRMED,
+            total_amount=total_amount
+        )
+        db.add(booking)
+        db.flush()
+
+        for s in seats:
+            item = BookingItem(
+                booking_id=booking.id,
+                show_seat_id=s.id,
+                price=s.price
+            )
+            db.add(item)
+
+        db.commit()
+        db.refresh(booking)
+
+        return {
+            "message": "Booking created successfully (Pessimistic Locking Mode)",
+            "data": {
+                "id": booking.id,
+                "userId": booking.user_id,
+                "showId": booking.show_id,
+                "status": booking.status.value,
+                "totalAmount": booking.total_amount,
+                "createdAt": booking.created_at.isoformat()
+            }
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/bookings/{booking_id}")
 def get_booking(booking_id: str, db: Session = Depends(get_db)):
     booking = db.query(Booking).options(

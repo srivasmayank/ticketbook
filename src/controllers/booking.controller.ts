@@ -162,3 +162,80 @@ export async function listUserBookings(req: Request, res: Response) {
 
   res.json({ data: bookings });
 }
+
+export async function createBookingOptimistic(req: Request, res: Response) {
+  const { userId, showId, showSeatIds } = req.body;
+
+  if (!userId || !showId || !Array.isArray(showSeatIds) || showSeatIds.length === 0) {
+    res.status(400).json({ error: 'userId, showId, and non-empty showSeatIds array are required' });
+    return;
+  }
+
+  try {
+    const booking = await prisma.$transaction(async (tx) => {
+      // Step 1: Read seats and versions
+      const seats = await tx.showSeat.findMany({
+        where: { id: { in: showSeatIds }, showId },
+        include: { seat: true },
+      });
+
+      if (seats.length !== showSeatIds.length) {
+        throw { status: 404, message: 'One or more seats not found' };
+      }
+
+      const unavailable = seats.filter((s) => s.status !== SeatStatus.AVAILABLE);
+      if (unavailable.length > 0) {
+        throw { status: 409, message: 'Seats are no longer available' };
+      }
+
+      // Simulate async delay
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Step 2: Atomic update with version check
+      for (const seat of seats) {
+        const result = await tx.showSeat.updateMany({
+          where: {
+            id: seat.id,
+            status: SeatStatus.AVAILABLE,
+            version: seat.version,
+          },
+          data: {
+            status: SeatStatus.BOOKED,
+            version: { increment: 1 },
+          },
+        });
+
+        if (result.count === 0) {
+          throw {
+            status: 409,
+            message: 'Concurrency conflict: Seat was booked by another user!',
+          };
+        }
+      }
+
+      // Step 3: Create booking
+      const totalAmount = seats.reduce((sum, s) => sum + Number(s.price), 0);
+      return tx.booking.create({
+        data: {
+          userId,
+          showId,
+          status: BookingStatus.CONFIRMED,
+          totalAmount,
+          items: {
+            create: seats.map((s) => ({
+              showSeatId: s.id,
+              price: s.price,
+            })),
+          },
+        },
+      });
+    });
+
+    res.status(201).json({
+      message: 'Booking created successfully (Optimistic Locking Mode)',
+      data: booking,
+    });
+  } catch (err: any) {
+    res.status(err.status || 500).json({ error: err.message || 'Internal Server Error' });
+  }
+}
